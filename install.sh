@@ -10,14 +10,22 @@
 #   --from <address>  where releases are kept (the folder holding `latest`); also HQ_RELEASES
 #   --version <v>     install that version instead of the latest; also HQ_VERSION
 #   --file <pack>     use this pack instead of downloading one (its <pack>.sha256 is checked when present)
+#   --ask             ask for the keys and the owner here in the terminal instead of in the browser
 #
-# A first install writes the settings file once, then, when it runs in a terminal, asks there for
-# what a new Bot HQ needs: the Orgo key, a Tailscale auth key (for the private address and coding
-# machines), the Composio and xAI keys, and the owner's name and email. Keys are typed hidden, and go
-# to the app on this computer in a request body, never on a command line or into a file or log; the
-# app tests each one with the same checks as the setup wizard in the browser. Any question can be
-# skipped with Enter, and the setup link printed at the end asks for whatever was skipped. With no
-# terminal (a script, or Orgo's bash API) it asks nothing and prints the link.
+# A first install writes the settings file once and prints the setup link: the browser wizard asks
+# for everything else (keys, the owner, the private network, coding). Keys belong in the browser by
+# default: pasting into a computer's terminal through Orgo's screen view is unreliable.
+#
+# With --ask, and a terminal, it asks there instead for what a new Bot HQ needs: the Orgo key, a
+# Tailscale auth key (for the private address and coding machines), the Composio and xAI keys, and the
+# owner's name and email. Keys are typed hidden, and go to the app on this computer in a request body,
+# never on a command line or into a file or log; the app tests each one with the same checks as the
+# setup wizard in the browser. Any question can be skipped with Enter, and the setup link printed at
+# the end asks for whatever was skipped.
+#
+# Run again on a computer whose saved address is still the example one from the instructions (an
+# earlier run given YOUR-ADDRESS or the like), it puts the real address in its place: the one given
+# with --url, or asked for in the terminal.
 #
 # An upgrade keeps the settings and the data, makes a checked backup first, and puts the previous code
 # back if the new version does not start.
@@ -289,7 +297,8 @@ usage() {
     printf '                      %s(like https://<name>-xxxx.web.orgo.dev)%s\n' "$d" "$n"
     printf '   %s--from%s <address>   %swhere releases are kept (the folder holding latest)%s\n' "$o" "$n" "$d" "$n"
     printf '   %s--version%s <v>      %sinstall that version instead of the latest%s\n' "$o" "$n" "$d" "$n"
-    printf '   %s--file%s <pack>      %suse a pack already on this computer%s\n\n' "$o" "$n" "$d" "$n"
+    printf '   %s--file%s <pack>      %suse a pack already on this computer%s\n' "$o" "$n" "$d" "$n"
+    printf '   %s--ask%s              %sask for the keys here instead of in the browser%s\n\n' "$o" "$n" "$d" "$n"
     return 0
   fi
   cat <<'EOF'
@@ -302,12 +311,14 @@ Install or upgrade Bot HQ on an Orgo computer that runs a Hermes agent (as root,
   --from <address>  where releases are kept (the folder holding `latest`)
   --version <v>     install that version instead of the latest
   --file <pack>     use a pack already on this computer instead of downloading one
+  --ask             ask for the keys and the owner here in the terminal instead of in the browser
 EOF
 }
 
 # ---------------------------------------------------------------- arguments
 
 OPT_URL="${PUBLIC_URL:-}"
+OPT_ASK="${HQ_ASK:-0}"
 OPT_FROM="${HQ_RELEASES:-}"
 OPT_VERSION="${HQ_VERSION:-}"
 OPT_FILE=""
@@ -322,6 +333,7 @@ parse_args() {
       --version=*) OPT_VERSION="${1#*=}"; shift ;;
       --file) OPT_FILE="${2:-}"; shift 2 || stop "--file needs a pack after it." ;;
       --file=*) OPT_FILE="${1#*=}"; shift ;;
+      --ask) OPT_ASK=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) stop "Unknown option: $1" "Run it with --help to see the options." ;;
     esac
@@ -453,6 +465,20 @@ ask_secret() {
   read_answer "$1" "$2" 1
   ANSWER="${ANSWER//[[:space:]]/}"
 }
+# After ESC: read the rest of the sequence and throw it away. A CSI sequence (ESC [ …) ends with a byte
+# from @ to ~; that covers arrow keys and the bracketed-paste markers ESC[200~ and ESC[201~ that
+# terminals wrap pasted text in, which must not end up inside a pasted key.
+drop_escape() {
+  local c n=0
+  IFS= read -r -s -n 1 -t 0.05 -u 3 c || return 0
+  if [ "$c" = "O" ]; then IFS= read -r -s -n 1 -t 0.05 -u 3 c || true; return 0; fi   # ESC O x
+  [ "$c" = "[" ] || return 0
+  # Parameter bytes (digits, ; and ?) until the final byte.
+  while [ $n -lt 16 ] && IFS= read -r -s -n 1 -t 0.05 -u 3 c; do
+    n=$((n + 1))
+    [[ "$c" =~ ^[0-9\;?]$ ]] || return 0
+  done
+}
 read_answer() {
   local label="$1" hint="$2" hide="$3" ch esc shown=0
   ANSWER=""
@@ -465,6 +491,7 @@ read_answer() {
       printf '  %s (%s): ' "$label" "$hint"
       IFS= read -r -u 3 ANSWER || ANSWER=""
     fi
+    strip_paste_marks
     return 0
   fi
   # One character at a time, so a key shows as dots and the hint goes once typing starts.
@@ -476,7 +503,7 @@ read_answer() {
         if [ -n "$ANSWER" ]; then ANSWER="${ANSWER%?}"; printf '\b \b'; fi ;;
       $'\025')                # Ctrl-U: start again
         while [ -n "$ANSWER" ]; do ANSWER="${ANSWER%?}"; printf '\b \b'; done ;;
-      $'\033') IFS= read -r -s -n 2 -t 0.05 -u 3 esc || true ;;   # arrow keys: not used here
+      $'\033') drop_escape ;;   # arrow keys and the markers some terminals put around a paste
       [[:cntrl:]]) ;;
       *)
         if [ "$shown" = 0 ]; then printf '\033[K'; shown=1; fi
@@ -485,7 +512,10 @@ read_answer() {
     esac
   done
   printf '\n'
+  strip_paste_marks
 }
+# The markers a terminal may put around pasted text (bracketed paste), wherever they got through.
+strip_paste_marks() { ANSWER="${ANSWER//$'\033[200~'/}"; ANSWER="${ANSWER//$'\033[201~'/}"; }
 
 # ---------------------------------------------------------------- 2. the public address (first install)
 
@@ -506,11 +536,31 @@ placeholder_url() {
 PLACEHOLDER_WORDS="That is the example address from the instructions, not this computer's own."
 MAKE_ONE="To make one in Orgo: open the computer's menu, choose Public URLs, enter port 8787, and click Add."
 
+# An installed Bot HQ whose saved address is the example one (an earlier run was given YOUR-ADDRESS or
+# the like) gets the real one in its place: from --url, or asked for here. Set in REPAIR_URL, and
+# written by repair_url once the installer holds its lock.
+REPAIR_URL=""
 ask_url() {
   PUBLIC=""
   if [ "$UPGRADE" = 1 ]; then
-    if [ -n "$OPT_URL" ] && [ "${OPT_URL%/}" != "$(key APP_URL "$SETTINGS")" ]; then
-      note "Note: this computer already has its settings, so the address given was not used. It keeps $(key APP_URL "$SETTINGS")."
+    local saved; saved="$(key APP_URL "$SETTINGS")"
+    if [ -n "$saved" ] && placeholder_url "$saved"; then
+      if [ -n "$OPT_URL" ] && ! placeholder_url "$OPT_URL"; then
+        REPAIR_URL="${OPT_URL%/}"
+        [[ "$REPAIR_URL" =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?$ ]] ||
+          stop "\"$OPT_URL\" is not a web address. It should look like https://<name>-xxxx.web.orgo.dev"
+        return 0
+      fi
+      open_tty || stop "This Bot HQ's saved address is the example one from the instructions ($saved), so its links do not work." \
+                       "Run the command again with this computer's own address, the one Orgo shows under Public URLs for port 8787:" \
+                       "  $(again_cmd "--url <the address Orgo shows>")"
+      note "This Bot HQ's saved address is the example one from the instructions ($saved). It needs this computer's own."
+      ask_public_address ""
+      REPAIR_URL="$PUBLIC"; PUBLIC=""
+      return 0
+    fi
+    if [ -n "$OPT_URL" ] && [ "${OPT_URL%/}" != "$saved" ]; then
+      note "Note: this computer already has its settings, so the address given was not used. It keeps $saved."
     fi
     return 0
   fi
@@ -533,6 +583,13 @@ ask_url() {
          "Make one in Orgo (the computer's menu, Public URLs, port 8787, Add), then run:" \
          "  $(again_cmd "--url $example")"
   fi
+  ask_public_address "$given"
+}
+
+# Ask in the terminal for the address Orgo shows for port 8787, into PUBLIC; stops after three tries.
+# $1 an example address given with --url, to say why it was not used.
+ask_public_address() {
+  local example="https://<name>-xxxx.web.orgo.dev" given="$1"
   if [ "$FANCY" = 1 ]; then
     q_head "Public address" "" "where you open Bot HQ in a browser"
     q_info "$MAKE_ONE"
@@ -559,8 +616,18 @@ ask_url() {
       redbar 0 "That does not look like an Orgo public address. It starts with https:// and ends with .orgo.dev."
     fi
   done
-  stop "No address was given, so nothing was installed." "Run the command again when you have it, or give it directly:" \
+  stop "No address was given, so nothing was changed." "Run the command again when you have it, or give it directly:" \
        "  $(again_cmd "--url $example")"
+}
+
+# Put the real address in place of the example one (REPAIR_URL), and restart Bot HQ so it uses it.
+repair_url() {
+  [ -n "$REPAIR_URL" ] || return 0
+  step "Saving this computer's address"
+  env_put "$SETTINGS" APP_URL "$REPAIR_URL"
+  [ -z "$(key SERVER_URL "$SETTINGS")" ] || env_put "$SETTINGS" SERVER_URL "$REPAIR_URL"
+  "$SUPERVISORCTL" restart hq-app >/dev/null 2>&1 || true
+  step_ok "Address saved" "$REPAIR_URL"
 }
 
 # ---------------------------------------------------------------- Hermes's API server (first install)
@@ -1216,7 +1283,12 @@ ask_owner() {
   local name email r tries=0
   q_head "[5/5]" "The owner" "who runs this Bot HQ"
   q_info "You invite people and manage this Bot HQ. You sign in with this email."
-  ask_line "Name" "Enter to skip"; name="$ANSWER"
+  ask_line "Name" "your name, like Sam Lee; Enter to skip"; name="$ANSWER"
+  if [[ "$name" == *@* ]]; then
+    redbar 0 "That looks like an email address. Type your name here; the email comes next."
+    ask_line "Name" "your name, like Sam Lee; Enter to skip"; name="$ANSWER"
+    [[ "$name" != *@* ]] || name=""
+  fi
   while [ $tries -lt 3 ]; do
     tries=$((tries + 1))
     ask_line "Email" "the one you will sign in with; Enter to skip"; email="$ANSWER"
@@ -1233,6 +1305,7 @@ ask_owner() {
 }
 
 ask_questions() {
+  [ "$OPT_ASK" = 1 ] || return 0
   open_tty || return 0
   { [ -x "$NODE_DIR/bin/node" ] && [ -n "$TMP" ] && [ -d "$TMP" ]; } || return 0
   write_api_helper
@@ -1366,6 +1439,7 @@ main() {
   lock
   trap cleanup EXIT
   recover
+  repair_url
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/hq-install.XXXXXX")"
   get_pack
   hermes_api_on
